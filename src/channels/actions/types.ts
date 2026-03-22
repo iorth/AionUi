@@ -13,6 +13,7 @@ export interface IActionContext {
   // Platform information
   platform: PluginType;
   pluginId: string;
+  canStream: boolean;
 
   // User information (from message)
   userId: string;
@@ -33,6 +34,8 @@ export interface IActionContext {
   // Helper functions
   sendMessage: (message: IUnifiedOutgoingMessage) => Promise<string>;
   editMessage: (messageId: string, message: IUnifiedOutgoingMessage) => Promise<void>;
+  streamMessage: (message: IUnifiedOutgoingMessage, streamId: string) => Promise<void>;
+  finalizeStreaming: (message: IUnifiedOutgoingMessage, streamid: string) => Promise<void>;
 }
 
 /**

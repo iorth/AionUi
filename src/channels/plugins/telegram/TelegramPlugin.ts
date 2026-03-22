@@ -9,7 +9,7 @@ import { Bot, GrammyError, HttpError } from 'grammy';
 
 import type { UserFromGetMe } from 'grammy/types';
 import type { BotInfo, IChannelPluginConfig, IUnifiedOutgoingMessage, PluginType } from '../../types';
-import { BasePlugin } from '../BasePlugin';
+import { BaseStreamingPlugin } from '../BaseStreamingPlugin';
 import { splitMessage, TELEGRAM_MESSAGE_LIMIT, toTelegramSendParams, toUnifiedIncomingMessage } from './TelegramAdapter';
 import { extractAction, extractCategory } from './TelegramKeyboards';
 
@@ -19,8 +19,9 @@ import { extractAction, extractCategory } from './TelegramKeyboards';
  * Uses grammY library for Telegram Bot API
  * Supports long-polling mode with automatic reconnection
  */
-export class TelegramPlugin extends BasePlugin {
+export class TelegramPlugin extends BaseStreamingPlugin {
   readonly type: PluginType = 'telegram';
+  readonly hasStreamingSupport = true;
 
   private bot: Bot | null = null;
   private botInfo: UserFromGetMe | null = null;
@@ -172,6 +173,47 @@ export class TelegramPlugin extends BasePlugin {
       console.error('[TelegramPlugin] Failed to edit message:', error);
       throw error;
     }
+  }
+
+  async streamMessage(chatId: string, message: IUnifiedOutgoingMessage, streamId: string): Promise<void> {
+    if (!this.bot) {
+      throw new Error('Bot not initialized');
+    }
+
+    const { text, options } = toTelegramSendParams(message);
+
+    // Truncate if too long (can't split when editing)
+    const truncatedText = text.length > TELEGRAM_MESSAGE_LIMIT ? text.slice(0, TELEGRAM_MESSAGE_LIMIT - 3) + '...' : text;
+
+    // Skip edit if text is empty or whitespace-only (Telegram API rejects it)
+    if (!truncatedText.trim()) {
+      return;
+    }
+
+    try {
+      // Use sendMessageDraft for streaming scenarios instead of editMessageText
+      // This enables better streaming behavior for real-time updates
+      await this.bot.api.sendMessageDraft(parseInt(chatId, 10), parseInt(streamId, 10), truncatedText, {
+        parse_mode: options.parse_mode,
+      });
+    } catch (error: any) {
+      // Fallback to editMessageText if sendMessageDraft fails
+      // This maintains backward compatibility
+      if (error instanceof GrammyError && error.description?.includes('message is not modified')) {
+        return;
+      }
+      console.error('[TelegramPlugin] Failed to send draft message:', error);
+      throw error;
+    }
+
+  }
+
+  async finalizeStreaming(chatId: string, message: IUnifiedOutgoingMessage, streamid: string): Promise<void> {
+    if (!this.bot) {
+      throw new Error('Bot not initialized');
+    }
+    const { text, options } = toTelegramSendParams(message);
+    await this.bot.api.sendMessage(chatId, text);
   }
 
   /**

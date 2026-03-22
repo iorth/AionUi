@@ -42,6 +42,8 @@ export abstract class BasePlugin {
    */
   abstract readonly type: PluginType;
 
+  protected hasStreamingSupport: boolean = false;
+
   /**
    * Current plugin status
    */

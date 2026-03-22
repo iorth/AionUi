@@ -26,6 +26,7 @@ import { escapeHtml } from '../plugins/telegram/TelegramAdapter';
 import type { ChannelAgentType, IUnifiedIncomingMessage, IUnifiedOutgoingMessage, PluginType } from '../types';
 import type { PluginManager } from './PluginManager';
 import type { AcpBackend } from '@/types/acpTypes';
+import { BaseStreamingPlugin } from '../plugins/BaseStreamingPlugin';
 
 // ==================== Platform-specific Helpers ====================
 
@@ -292,6 +293,7 @@ export class ActionExecutor {
     const context: IActionContext = {
       platform,
       pluginId: `${platform}_default`, // TODO: Get actual plugin ID
+      canStream: plugin instanceof BaseStreamingPlugin,
       userId: user.id,
       chatId,
       displayName: user.displayName,
@@ -299,6 +301,12 @@ export class ActionExecutor {
       originalMessageId: message.id,
       sendMessage: async (msg) => plugin.sendMessage(chatId, msg),
       editMessage: async (msgId, msg) => plugin.editMessage(chatId, msgId, msg),
+      streamMessage: async (msg, streamId) => {
+        plugin instanceof BaseStreamingPlugin && plugin.streamMessage(chatId, msg, streamId);
+      },
+      finalizeStreaming: async (msg, streamId) => {
+        plugin instanceof BaseStreamingPlugin && plugin.finalizeStreaming(chatId, msg, streamId);
+      }    
     };
 
     try {
@@ -496,16 +504,14 @@ export class ActionExecutor {
       this.sessionManager.updateSessionActivity(context.channelUser.id, context.chatId);
     }
 
-    // Send "thinking" indicator
-    const thinkingMsgId = await context.sendMessage({
-      type: 'text',
-      text: '⏳ Thinking...',
-      parseMode: 'HTML',
-    });
+    // 跟踪已发送的消息 ID，用于新插入消息的管理
+    // Track sent message IDs for new inserted messages
 
+    const sentMessageIds: string[] = [];
     try {
       const sessionId = context.sessionId;
       const conversationId = context.conversationId;
+      const streamId = Math.floor(Math.random() * 100).toString();
 
       if (!sessionId || !conversationId) {
         throw new Error('Session not initialized');
@@ -520,10 +526,6 @@ export class ActionExecutor {
       let pendingUpdateTimer: ReturnType<typeof setTimeout> | null = null;
       let pendingMessage: IUnifiedOutgoingMessage | null = null;
 
-      // 跟踪已发送的消息 ID，用于新插入消息的管理
-      // Track sent message IDs for new inserted messages
-      const sentMessageIds: string[] = [thinkingMsgId];
-
       // 跟踪最后一条消息内容，用于流结束后添加操作按钮
       // Track last message content for adding action buttons after stream ends
       let lastMessageContent: IUnifiedOutgoingMessage | null = null;
@@ -532,7 +534,7 @@ export class ActionExecutor {
       // Function to perform message edit
       const doEditMessage = async (msg: IUnifiedOutgoingMessage) => {
         lastUpdateTime = Date.now();
-        const targetMsgId = sentMessageIds[sentMessageIds.length - 1] || thinkingMsgId;
+        const targetMsgId = sentMessageIds[sentMessageIds.length - 1];
         try {
           await context.editMessage(targetMsgId, msg);
         } catch {
@@ -540,10 +542,91 @@ export class ActionExecutor {
         }
       };
 
+      const streamMessage = async (msg: IUnifiedOutgoingMessage) => {
+        lastUpdateTime = Date.now();
+        try {
+          context.streamMessage(msg, streamId)
+        } catch {
+
+        }
+      };
+
+      // 处理非流式消息（当 canStream 为 false 时使用）
+      // Handle non-streaming messages (used when canStream is false)
+      const handleStreamingMessage = async (msg: IUnifiedOutgoingMessage, isInsert: boolean, streamFunc: (msg: IUnifiedOutgoingMessage) => Promise<void>) => {
+        const now = Date.now();
+        // IMPORTANT: Always treat first streaming message as update to thinking message
+        // This prevents async race condition where first insert's sendMessage takes time
+        // while subsequent messages arrive and get processed as updates
+        // 重要：始终将第一个流式消息视为更新thinking消息
+        // 这可以防止异步竞态条件：第一个insert的sendMessage耗时时，后续消息已到达并被当作update处理
+        if (isInsert && sentMessageIds.length === 1) {
+          // First streaming message: update thinking message instead of inserting
+          // 第一个流式消息：更新thinking消息而不是插入新消息
+          pendingMessage = msg;
+
+          if (now - lastUpdateTime >= UPDATE_THROTTLE_MS) {
+            if (pendingUpdateTimer) {
+              clearTimeout(pendingUpdateTimer);
+              pendingUpdateTimer = null;
+            }
+            await streamFunc(msg)
+          } else {
+            if (pendingUpdateTimer) {
+              clearTimeout(pendingUpdateTimer);
+            }
+            const delay = UPDATE_THROTTLE_MS - (now - lastUpdateTime);
+            pendingUpdateTimer = setTimeout(() => {
+              if (pendingMessage) {
+                void streamFunc(pendingMessage);
+                pendingMessage = null;
+              }
+              pendingUpdateTimer = null;
+            }, delay);
+          }
+        } else if (isInsert) {
+          // 新消息：发送新消息
+          // New message: send new message
+          try {
+            const newMsgId = await context.sendMessage(msg);
+            sentMessageIds.push(newMsgId);
+          } catch {
+            // Ignore send errors
+          }
+        } else {
+          // 更新消息：使用定时器节流，确保最后一条消息能被发送
+          // Update message: throttle with timer to ensure last message is sent
+          pendingMessage = msg;
+
+          if (now - lastUpdateTime >= UPDATE_THROTTLE_MS) {
+            // 距离上次发送超过节流时间，立即发送
+            // Enough time has passed since last send, send immediately
+            if (pendingUpdateTimer) {
+              clearTimeout(pendingUpdateTimer);
+              pendingUpdateTimer = null;
+            }
+            await streamFunc(msg);
+          } else {
+            // 在节流时间内，设置定时器延迟发送
+            // Within throttle window, set timer to send later
+            if (pendingUpdateTimer) {
+              clearTimeout(pendingUpdateTimer);
+            }
+            const delay = UPDATE_THROTTLE_MS - (now - lastUpdateTime);
+            pendingUpdateTimer = setTimeout(() => {
+              if (pendingMessage) {
+                void streamFunc(pendingMessage);
+                pendingMessage = null;
+              }
+              pendingUpdateTimer = null;
+            }, delay);
+          }
+        }
+      };
+
       // 发送消息
       // Send message
       await messageService.sendMessage(sessionId, conversationId, text, async (message: TMessage, isInsert: boolean) => {
-        const now = Date.now();
 
         // 转换消息格式（根据平台）
         // Convert message format (based on platform)
@@ -555,76 +638,18 @@ export class ActionExecutor {
         // Channel conversations use yoloMode (auto-approve), so confirmation buttons are unnecessary.
         const streamOutgoing: IUnifiedOutgoingMessage = { ...outgoingMessage, replyMarkup: undefined };
 
-        // 保存最后一条消息内容（不含 replyMarkup，最终消息会单独添加）
-        // Save last message content (without replyMarkup, final message adds it separately)
         lastMessageContent = streamOutgoing;
 
-        // IMPORTANT: Always treat first streaming message as update to thinking message
-        // This prevents async race condition where first insert's sendMessage takes time
-        // while subsequent messages arrive and get processed as updates
-        // 重要：始终将第一个流式消息视为更新thinking消息
-        // 这可以防止异步竞态条件：第一个insert的sendMessage耗时时，后续消息已到达并被当作update处理
-        if (isInsert && sentMessageIds.length === 1) {
-          // First streaming message: update thinking message instead of inserting
-          // 第一个流式消息：更新thinking消息而不是插入新消息
-          pendingMessage = streamOutgoing;
-
-          if (now - lastUpdateTime >= UPDATE_THROTTLE_MS) {
-            if (pendingUpdateTimer) {
-              clearTimeout(pendingUpdateTimer);
-              pendingUpdateTimer = null;
-            }
-            await doEditMessage(streamOutgoing);
-          } else {
-            if (pendingUpdateTimer) {
-              clearTimeout(pendingUpdateTimer);
-            }
-            const delay = UPDATE_THROTTLE_MS - (now - lastUpdateTime);
-            pendingUpdateTimer = setTimeout(() => {
-              if (pendingMessage) {
-                void doEditMessage(pendingMessage);
-                pendingMessage = null;
-              }
-              pendingUpdateTimer = null;
-            }, delay);
-          }
-        } else if (isInsert) {
-          // 新消息：发送新消息
-          // New message: send new message
-          try {
-            const newMsgId = await context.sendMessage(streamOutgoing);
-            sentMessageIds.push(newMsgId);
-          } catch {
-            // Ignore send errors
-          }
+        if (context.canStream) {
+          await handleStreamingMessage(streamOutgoing, false, streamMessage)
         } else {
-          // 更新消息：使用定时器节流，确保最后一条消息能被发送
-          // Update message: throttle with timer to ensure last message is sent
-          pendingMessage = streamOutgoing;
-
-          if (now - lastUpdateTime >= UPDATE_THROTTLE_MS) {
-            // 距离上次发送超过节流时间，立即发送
-            // Enough time has passed since last send, send immediately
-            if (pendingUpdateTimer) {
-              clearTimeout(pendingUpdateTimer);
-              pendingUpdateTimer = null;
-            }
-            await doEditMessage(streamOutgoing);
-          } else {
-            // 在节流时间内，设置定时器延迟发送
-            // Within throttle window, set timer to send later
-            if (pendingUpdateTimer) {
-              clearTimeout(pendingUpdateTimer);
-            }
-            const delay = UPDATE_THROTTLE_MS - (now - lastUpdateTime);
-            pendingUpdateTimer = setTimeout(() => {
-              if (pendingMessage) {
-                void doEditMessage(pendingMessage);
-                pendingMessage = null;
-              }
-              pendingUpdateTimer = null;
-            }, delay);
-          }
+          const thinkingMsgId = await context.sendMessage({
+            type: 'text',
+            text: '⏳ Thinking...',
+            parseMode: 'HTML',
+          });
+          sentMessageIds.push(thinkingMsgId);
+          await handleStreamingMessage(streamOutgoing, isInsert, doEditMessage);
         }
       });
 
@@ -638,7 +663,11 @@ export class ActionExecutor {
       // If there's a pending message, send it immediately
       if (pendingMessage) {
         try {
-          await doEditMessage(pendingMessage);
+          if (context.canStream) {
+            await streamMessage(pendingMessage);
+          } else {
+            await doEditMessage(pendingMessage);
+          }
         } catch {
           // Ignore final edit error
         }
@@ -647,13 +676,17 @@ export class ActionExecutor {
 
       // 流结束后，更新最后一条消息添加操作按钮（保留原内容）
       // After stream ends, update last message with action buttons (keep original content)
-      const lastMsgId = sentMessageIds[sentMessageIds.length - 1] || thinkingMsgId;
       try {
         // 使用最后一条消息的实际内容，添加操作按钮（根据平台）
         // Use actual content of last message, add action buttons (based on platform)
         const responseMarkup = getResponseActionsMarkup(context.platform as PluginType, lastMessageContent?.text);
         const finalMessage: IUnifiedOutgoingMessage = lastMessageContent ? { ...lastMessageContent, replyMarkup: responseMarkup } : { type: 'text', text: '✅ Done', parseMode: 'HTML', replyMarkup: responseMarkup };
-        await context.editMessage(lastMsgId, finalMessage);
+        if (context.canStream) {
+          await context.finalizeStreaming(finalMessage, streamId);
+        } else {
+          const lastMsgId = sentMessageIds[sentMessageIds.length - 1];
+          await context.editMessage(lastMsgId, finalMessage);
+        }
       } catch {
         // 忽略最终编辑错误
         // Ignore final edit error
@@ -663,7 +696,7 @@ export class ActionExecutor {
 
       // Update message with error
       const errorResponse = buildChatErrorResponse(error.message);
-      await context.editMessage(thinkingMsgId, {
+      await context.editMessage(sentMessageIds[0], {
         type: 'text',
         text: errorResponse.text,
         parseMode: errorResponse.parseMode,
